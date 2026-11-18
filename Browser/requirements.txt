@@ -1,0 +1,5 @@
+flask>=3.0,<4
+# SQLCipher driver for password-protected databases (same version as Parser).
+# Not needed for plain SQLite files; remove this line if the install fails and you
+# only browse unencrypted databases.
+sqlcipher3==0.6.5
