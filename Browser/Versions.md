@@ -27,3 +27,10 @@ V0.2.1 - Hosting on VPS (2026/11/23)
 - deploy/ folder: systemd unit and nginx site files; README "Deployment on the VPS" section
 - waitress added to requirements.txt
 
+V0.2.2 - Session security (2026/11/23)
+
+- Sessions are recorded on the server; signing out ends the session at once, so a copied cookie stops working
+- Disabling, role change, password reset or deleting an account ends all of that user's sessions
+- SESSION_HOURS setting for how long a sign-in lasts (default 12)
+- .env, data/ and instance/ readable only by root on the server
+- README: security model section

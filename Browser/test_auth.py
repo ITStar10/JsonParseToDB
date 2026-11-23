@@ -153,6 +153,75 @@ class ProxySettingsTests(unittest.TestCase):
         self.assertEqual(client.post("/api/auth/login", json=body, headers=hdr("10.0.0.2")).status_code, 401)
 
 
+class ServerSessionTests(AuthTestCase):
+    """Sessions live on the server: signing out or admin actions make copied cookies useless."""
+
+    def copy_session(self, client):
+        cookie = client.get_cookie("dbbrowser_session")
+        other = self.app.test_client()
+        other.set_cookie("dbbrowser_session", cookie.value, domain=cookie.domain or "localhost")
+        return other
+
+    def test_copied_cookie_stops_working_after_sign_out(self):
+        _, user = self.approved_user()
+        thief = self.copy_session(user)
+        self.assertEqual(thief.get("/api/tables").status_code, 200)  # a copy works while signed in
+        user.post("/api/auth/logout", json={})
+        self.assertEqual(thief.get("/api/tables").status_code, 401)
+        self.assertEqual(user.get("/api/tables").status_code, 401)
+
+    def test_sign_out_ends_only_that_session(self):
+        _, laptop = self.approved_user()
+        phone, _ = self.login()
+        laptop.post("/api/auth/logout", json={})
+        self.assertEqual(phone.get("/api/tables").status_code, 200)
+
+    def test_expired_session_is_refused(self):
+        _, user = self.approved_user()
+        self.users._conn.execute("UPDATE sessions SET expires_at = 0")
+        self.assertEqual(user.get("/api/tables").status_code, 401)
+
+    def test_admin_actions_end_all_sessions(self):
+        uid, user = self.approved_user()
+        thief = self.copy_session(user)
+        self.admin.post(f"/api/admin/users/{uid}/password", json={"password": "reset-pass-99"})
+        self.assertEqual(thief.get("/api/tables").status_code, 401)
+        self.assertEqual(self.users._one("SELECT count(*) FROM sessions WHERE user_id = ?", (uid,))[0], 0)
+        client, _ = self.login({**USER, "password": "reset-pass-99"})
+        self.admin.delete(f"/api/admin/users/{uid}")
+        self.assertEqual(client.get("/api/tables").status_code, 401)
+        self.assertEqual(self.users._one("SELECT count(*) FROM sessions WHERE user_id = ?", (uid,))[0], 0)
+
+    def test_cookie_without_server_session_is_refused(self):
+        # A cookie signed with the real key but not backed by a server-side session
+        # (e.g. from before this change, or forged with a leaked key) must not work.
+        from flask.sessions import SecureCookieSessionInterface
+        uid, _ = self.approved_user()
+        serializer = SecureCookieSessionInterface().get_signing_serializer(self.app)
+        old_style = serializer.dumps({"uid": uid, "ver": self.users.get(uid)["session_version"]})
+        client = self.app.test_client()
+        client.set_cookie("dbbrowser_session", old_style, domain="localhost")
+        self.assertEqual(client.get("/api/tables").status_code, 401)
+        forged = serializer.dumps({"sid": "made-up-token", "ver": 1})
+        client.set_cookie("dbbrowser_session", forged, domain="localhost")
+        self.assertEqual(client.get("/api/tables").status_code, 401)
+
+    def test_tokens_are_stored_hashed(self):
+        _, user = self.approved_user()
+        raw = [r[0] for r in self.users._conn.execute("SELECT token_hash FROM sessions")]
+        self.assertTrue(raw and all(len(h) == 64 for h in raw))  # sha256 hex, not the token itself
+
+    def test_session_hours_setting(self):
+        import os
+        from config import load_settings
+        for value, expected in (("2", 2), ("0", 1), ("99999", 720)):
+            os.environ["SESSION_HOURS"] = value
+            try:
+                self.assertEqual(load_settings().session_hours, expected)
+            finally:
+                del os.environ["SESSION_HOURS"]
+
+
 class AdminGuardTests(AuthTestCase):
     def admin_id(self):
         return self.user_id(ADMIN["email"])

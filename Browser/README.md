@@ -50,6 +50,7 @@ a `#` after a value is part of the value.
 | `SECRET_KEY` | generated once into `instance/secret_key` | Signs session cookies. Changing it signs everyone out. |
 | `COOKIE_SECURE` | `false` | Set `true` when the site is served over HTTPS. |
 | `ALLOWED_HOSTS` | empty | Extra host names or IPs users type in the address bar (comma separated). Needed when serving to other machines. |
+| `SESSION_HOURS` | `12` | How long a sign-in lasts (1–720 hours). |
 | `TRUST_PROXY` | `false` | `true` only when exactly one reverse proxy is in front; takes the client IP and scheme from its `X-Forwarded-*` headers. |
 
 - Admins can edit `.env` while the app runs and click ↻ in the top bar (or
@@ -76,6 +77,28 @@ a `#` after a value is part of the value.
 - Passwords are stored as salted hashes (Werkzeug scrypt). Sign-in and sign-up
   are rate limited per client IP.
 
+### Security model
+
+- **Every API call needs a live session** except sign-up, sign-in, sign-out and
+  "who am I". The session cookie is signed with `SECRET_KEY`, `HttpOnly`,
+  `SameSite=Lax`, `Secure` with `COOKIE_SECURE=true`, and only carries a random
+  token.
+- **Sessions are recorded on the server** (`sessions` table, token stored as a
+  SHA-256 hash). Each request checks the token is still on record and not
+  expired (`SESSION_HOURS`).
+  - Signing out deletes the record, so a copied cookie stops working at once.
+  - Disabling a user, changing their role, resetting their password or deleting
+    the account ends all their sessions.
+  - Changing your own password ends your other sessions.
+- **Rules are checked on the server on every request**: rows, columns, edits and
+  admin-only actions. Requests from other sites are refused (Origin check, JSON
+  bodies).
+- **Approved users can copy what they are allowed to see**, for example by
+  paging through the API. Limit that with the rows, random rows and visible
+  columns you share.
+- **Keep secrets private on the server:** `.env`, `data/` and `instance/` should
+  be readable only by the account that runs the app (`chmod 600 .env`,
+  `chmod 700 data instance`).
 
 From the command line (in `Browser/`):
 

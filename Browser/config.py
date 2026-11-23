@@ -51,6 +51,7 @@ class Settings:
     cookie_secure: bool = False         # set true when served over HTTPS
     allowed_hosts: tuple = ()           # public host names when behind a reverse proxy
     trust_proxy: bool = False           # honour X-Forwarded-For / -Proto from one proxy
+    session_hours: int = 12             # sign-in lifetime; sessions end after this many hours
 
 
 def resolve_path(value):
@@ -107,4 +108,5 @@ def load_settings():
         cookie_secure=_flag(get("COOKIE_SECURE", "false")),
         allowed_hosts=tuple(h.strip().lower() for h in get("ALLOWED_HOSTS").split(",") if h.strip()),
         trust_proxy=_flag(get("TRUST_PROXY", "false")),
+        session_hours=min(720, max(1, int(get("SESSION_HOURS", "12").strip() or 12))),
     )

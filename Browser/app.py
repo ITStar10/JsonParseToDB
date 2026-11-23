@@ -49,7 +49,7 @@ def create_app(settings=None):
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=settings.cookie_secure,
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=settings.session_hours),
     )
     if not app.config["SECRET_KEY"]:
         raise RuntimeError("SECRET_KEY is required")
@@ -94,10 +94,13 @@ def create_app(settings=None):
                 return jsonify(error="Expected a JSON request body"), 415
 
         # Load the user fresh on every request: status/role changes apply immediately.
+        # The cookie holds a random session token; it must still be on record server-side
+        # (signing out, admin actions and expiry remove it).
         g.user = None
-        uid = session.get("uid")
-        if uid is not None:
-            row = users.get(uid)
+        token = session.get("sid")
+        if token is not None or session.get("uid") is not None:
+            uid = users.session_user(token)
+            row = users.get(uid) if uid is not None else None
             if row and row["status"] == "approved" and session.get("ver") == row["session_version"]:
                 g.user = row
             else:
@@ -301,14 +304,16 @@ def create_app(settings=None):
             return jsonify(error="Too many sign-in attempts. Wait a few minutes and try again."), 429
         row = users.authenticate(email, data.get("password"))
         login_limit.reset(key)
+        users.end_session(session.get("sid"))  # replace any previous session in this browser
         session.clear()
         session.permanent = True
-        session["uid"] = row["id"]
+        session["sid"] = users.create_session(row["id"], settings.session_hours)
         session["ver"] = row["session_version"]
         return jsonify(user=users.public(row))
 
     @app.post("/api/auth/logout")
     def logout():
+        users.end_session(session.get("sid"))  # a copied cookie stops working too
         session.clear()
         return jsonify(ok=True)
 
@@ -320,8 +325,9 @@ def create_app(settings=None):
         except AuthError:
             raise RequestError("Your current password is incorrect") from None
         users.set_password(g.user["id"], data.get("newPassword"))
+        users.end_user_sessions(g.user["id"], keep_token=session.get("sid"))  # end the others
         row = users.get(g.user["id"])
-        session["ver"] = row["session_version"]  # keep this session, end the others
+        session["ver"] = row["session_version"]  # keep this session
         return jsonify(ok=True)
 
     # ------------------------------------------------------------- data api
@@ -462,6 +468,7 @@ def create_app(settings=None):
     @app.post("/api/admin/users/<int:user_id>/password")
     def admin_set_password(user_id):
         users.set_password(user_id_arg(user_id), body().get("password"))
+        users.end_user_sessions(user_id)
         return jsonify(ok=True)
 
     @app.delete("/api/admin/users/<int:user_id>")

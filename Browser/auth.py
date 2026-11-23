@@ -3,6 +3,7 @@
 Stored in a separate plain SQLite file (default Browser/instance/users.sqlite3),
 so the data database is never modified for authentication purposes.
 """
+import hashlib
 import json
 import re
 import secrets
@@ -50,6 +51,13 @@ CREATE TABLE IF NOT EXISTS default_access_rules (
     seed INTEGER NOT NULL DEFAULT 0,      -- changes which random rows ("reshuffle")
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,          -- sha256 of the random token in the session cookie
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at REAL NOT NULL              -- unix time; the session is refused after this
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 CREATE TABLE IF NOT EXISTS visible_columns (
     table_name TEXT PRIMARY KEY,
     columns TEXT NOT NULL,                -- JSON list of column names regular users may see
@@ -237,6 +245,7 @@ class UserStore:
                 "UPDATE users SET status = ?, decided_at = ?, decided_by = ?, "
                 "session_version = session_version + 1 WHERE id = ?",
                 (status, now(), actor_id, user_id))
+            self.end_user_sessions(user_id)
             return self.public(self.get(user_id))
 
     def set_role(self, user_id, role, actor_id):
@@ -248,6 +257,7 @@ class UserStore:
                 self._guard_last_admin(target, actor_id, "demote")
             self._conn.execute("UPDATE users SET role = ?, session_version = session_version + 1 "
                                "WHERE id = ?", (role, user_id))
+            self.end_user_sessions(user_id)
             return self.public(self.get(user_id))
 
     def set_password(self, user_id, password):
@@ -256,6 +266,46 @@ class UserStore:
             self.require(user_id)
             self._conn.execute("UPDATE users SET password_hash = ?, session_version = session_version + 1 "
                                "WHERE id = ?", (generate_password_hash(password), user_id))
+
+    # ------------------------------------------------------------ sessions
+    # Server-side record of every sign-in. The cookie only carries a random token; signing out
+    # deletes the record, so a copied cookie stops working at once.
+    @staticmethod
+    def _token_hash(token):
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def create_session(self, user_id, hours):
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+            self._conn.execute(
+                "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (self._token_hash(token), user_id, now(), time.time() + hours * 3600))
+        return token
+
+    def session_user(self, token):
+        """User id for a live session token, or None (unknown, signed out or expired)."""
+        if not isinstance(token, str) or not token:
+            return None
+        row = self._one("SELECT user_id, expires_at FROM sessions WHERE token_hash = ?",
+                        (self._token_hash(token),))
+        if row is None or row["expires_at"] < time.time():
+            return None
+        return row["user_id"]
+
+    def end_session(self, token):
+        if isinstance(token, str) and token:
+            with self._lock:
+                self._conn.execute("DELETE FROM sessions WHERE token_hash = ?", (self._token_hash(token),))
+
+    def end_user_sessions(self, user_id, keep_token=None):
+        """Sign a user out everywhere (optionally except one session)."""
+        with self._lock:
+            if keep_token:
+                self._conn.execute("DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?",
+                                   (user_id, self._token_hash(keep_token)))
+            else:
+                self._conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
 
     def delete(self, user_id, actor_id):
         with self._lock:
