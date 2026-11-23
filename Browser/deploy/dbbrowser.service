@@ -1,0 +1,24 @@
+# systemd unit for DB Browser (copy to /etc/systemd/system/dbbrowser.service).
+# The app listens on 127.0.0.1 only; nginx (nginx-dbbrowser.conf) serves it over HTTPS.
+[Unit]
+Description=DB Browser (JsonParseToDB/Browser) behind nginx on :9443
+After=network.target
+
+[Service]
+Type=exec
+WorkingDirectory=/work/alex/JsonParseToDB/Browser
+ExecStart=/work/alex/JsonParseToDB/Browser/.venv/bin/waitress-serve --host 127.0.0.1 --port 8765 --threads 8 --ident DBBrowser --call app:create_app
+Environment=PYTHONDONTWRITEBYTECODE=1
+Restart=on-failure
+RestartSec=3
+UMask=0077
+# Sandboxing: the whole filesystem is read-only except the data file's folder
+# (SQLite needs to create its journal next to the file) and instance/ (accounts).
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/work/alex/JsonParseToDB/Browser/data /work/alex/JsonParseToDB/Browser/instance
+
+[Install]
+WantedBy=multi-user.target

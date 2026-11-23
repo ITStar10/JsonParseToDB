@@ -76,6 +76,7 @@ a `#` after a value is part of the value.
 - Passwords are stored as salted hashes (Werkzeug scrypt). Sign-in and sign-up
   are rate limited per client IP.
 
+
 From the command line (in `Browser/`):
 
 ```powershell
@@ -229,6 +230,37 @@ it. To let others connect:
 Alternatives for a small known group: a VPN such as Tailscale, or VS Code's
 port forwarding for a temporary demo.
 
+### Deployment on the VPS (`deploy/`)
+
+The app is hosted at `https://<server IP>:9443` with the files in `deploy/`:
+
+| File | Installed as | Purpose |
+|---|---|---|
+| `dbbrowser.service` | `/etc/systemd/system/dbbrowser.service` | Runs waitress on `127.0.0.1:8765`, starts at boot, restarts on failure. Sandboxed: only `data/` and `instance/` are writable. |
+| `nginx-dbbrowser.conf` | `/etc/nginx/sites-available/dbbrowser` (+ link in `sites-enabled`) | HTTPS on port 9443, redirects `http://` to `https://`, rate limits sign-in/sign-up. |
+| `nginx-dbbrowser-proxy.conf` | `/etc/nginx/dbbrowser-proxy.conf` | Proxy headers the app trusts with `TRUST_PROXY=true`. |
+
+The certificate is self-signed (`/etc/nginx/dbbrowser-tls/`), so each browser
+shows a one-time warning that users accept. `.env` contains
+`HOST=127.0.0.1`, `PORT=8765`, `ALLOWED_HOSTS=<server IP>`, `TRUST_PROXY=true`
+and `COOKIE_SECURE=true`.
+
+Day-to-day commands (as root):
+
+```bash
+systemctl restart dbbrowser            # after changing code or .env
+systemctl status dbbrowser
+journalctl -u dbbrowser -f             # live log
+nginx -t && systemctl reload nginx     # after changing the nginx files
+```
+
+To set it up on another server: install the three files (adjust paths and the
+IP), create the certificate with
+`openssl req -x509 -newkey rsa:2048 -nodes -days 825 -keyout server.key -out server.crt -subj "/CN=DB Browser" -addext "subjectAltName=IP:<server IP>"`,
+then `systemctl daemon-reload && systemctl enable --now dbbrowser` and reload
+nginx. Back up `data/` and `instance/` regularly; edits go straight into the
+data file.
+
 ## Demo data
 
 ```powershell
@@ -263,6 +295,7 @@ manage.py       create-admin / reset-password / list-users
 static/         index.html + app.js (data page), login.html + login.js,
                 admin.html + admin.js (Users page), common.js, app.css, icons.svg
 tools/          make_sample_db.py
+deploy/         systemd service and nginx site used for hosting
 instance/       users.sqlite3 and secret_key (created on first run, git-ignored)
 test_browser.py, test_auth.py
 ```
