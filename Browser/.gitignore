@@ -13,3 +13,6 @@ venv/
 *.sqlite3-journal
 *-wal
 *-shm
+
+# Accounts database and session secret key
+instance/

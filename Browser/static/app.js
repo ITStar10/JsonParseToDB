@@ -2,81 +2,9 @@
 (() => {
   "use strict";
 
-  // ------------------------------------------------------------------ helpers
-  const $ = (id) => document.getElementById(id);
-  const SVG_NS = "http://www.w3.org/2000/svg";
-
-  function h(tag, attrs, ...children) {
-    const el = document.createElement(tag);
-    for (const [k, v] of Object.entries(attrs || {})) {
-      if (v === null || v === undefined || v === false) continue;
-      if (k === "class") el.className = v;
-      else if (k === "dataset") Object.assign(el.dataset, v);
-      else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
-      else if (k in el && typeof v !== "string") el[k] = v;
-      else el.setAttribute(k, v === true ? "" : v);
-    }
-    for (const c of children.flat(Infinity)) {
-      if (c === null || c === undefined || c === false) continue;
-      el.append(c instanceof Node ? c : String(c));
-    }
-    return el;
-  }
-
-  function icon(name, cls) {
-    const svg = document.createElementNS(SVG_NS, "svg");
-    if (cls) svg.setAttribute("class", cls);
-    svg.setAttribute("aria-hidden", "true");
-    const use = document.createElementNS(SVG_NS, "use");
-    use.setAttribute("href", "#i-" + name);
-    svg.append(use);
-    return svg;
-  }
-
-  const store = {
-    get(key, fallback) {
-      try { const v = localStorage.getItem("dbb:" + key); return v === null ? fallback : JSON.parse(v); }
-      catch { return fallback; }
-    },
-    set(key, value) {
-      try { localStorage.setItem("dbb:" + key, JSON.stringify(value)); } catch { /* ignore */ }
-    },
-  };
-
-  const fmt = (n) => Number(n).toLocaleString();
-  const fmtBytes = (b) => b < 1024 ? `${b} B` : b < 1048576 ? `${(b / 1024).toFixed(1)} KB`
-    : b < 1073741824 ? `${(b / 1048576).toFixed(1)} MB` : `${(b / 1073741824).toFixed(2)} GB`;
+  // ------------------------------------------------------------------ helpers (static/common.js)
+  const { $, h, icon, store, fmt, fmtBytes, debounce, api, toast, confirmDialog } = window.UI;
   const isNumericKind = (k) => k === "integer" || k === "number";
-
-  function debounce(fn, ms) {
-    let t;
-    return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
-  }
-
-  class ApiError extends Error {
-    constructor(message, status, code) { super(message); this.status = status; this.code = code; }
-  }
-
-  async function api(path, { method = "GET", body, signal } = {}) {
-    const opts = { method, signal, headers: { Accept: "application/json" } };
-    if (body !== undefined) {
-      opts.headers["Content-Type"] = "application/json";
-      opts.body = JSON.stringify(body);
-    }
-    let res;
-    try { res = await fetch(path, opts); }
-    catch (e) {
-      if (e.name === "AbortError") throw e;
-      throw new ApiError("Can’t reach the server. Is app.py still running?", 0);
-    }
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const err = new ApiError(data.error || `Request failed (${res.status})`, res.status, data.code);
-      if (data.code === "database_unavailable") showError(err.message);
-      throw err;
-    }
-    return data;
-  }
 
   const tablePath = (name) => "/api/tables/" + encodeURIComponent(name);
 
@@ -89,6 +17,8 @@
     rows: [],
     total: 0, page: 1, pages: 1,
     pageSize: store.get("pageSize", 50),
+    published: {},        // admin only: data shown to users, {table: {mode, filters}}
+    usersHidden: {},      // admin only: {table: [columns hidden from regular users]}
     colFilters: {},       // column name -> text typed in that column's filter box
     sort: null, dir: "asc",
     selected: new Set(),
@@ -143,8 +73,6 @@
 
   const PREFIXES = [[">=", "gte"], ["<=", "lte"], ["!=", "not_equals"], [">", "gt"], ["<", "lt"],
                     ["=", "equals"], ["!", "not_contains"]];
-  const NEGATIVE = new Set(["not_equals", "not_contains", "not_empty"]);
-
   /** One comma-separated term -> API filter (or null). */
   function parseTerm(col, term) {
     const column = col.name;
@@ -171,71 +99,19 @@
     return { column, op: "contains", value: unquote(term) };
   }
 
-  /** Text typed in a column's filter box -> API filter (or null).
-   *  Positive terms are OR-ed ("austin, boston"); exclusions are AND-ed ("!a, !b"). */
-  function parseColumnFilter(col, raw) {
-    if (raw === undefined || raw === null || raw === "") return null;
-    if (col.kind === "boolean") {
-      if (raw === "null") return { column: col.name, op: "is_null" };
-      return { column: col.name, op: "equals", value: raw };
-    }
-    const pos = [], neg = [];
-    for (const term of splitTerms(raw)) {
-      const f = parseTerm(col, term);
-      if (f) (NEGATIVE.has(f.op) ? neg : pos).push(f);
-    }
-    const parts = [...(pos.length > 1 ? [{ any: pos }] : pos), ...neg];
-    if (!parts.length) return null;
-    return parts.length === 1 ? parts[0] : { all: parts };
-  }
-
-  const activeFilters = (exceptColumn) => (state.meta ? state.meta.columns : [])
-    .filter((c) => c.name !== exceptColumn)
-    .map((c) => parseColumnFilter(c, state.colFilters[c.name])).filter(Boolean);
-  const hasFilters = () => activeFilters().length > 0;
+  // The server parses the filter-box text (filters.py); here it is only used for
+  // highlighting matches and pre-selecting values in the picker.
+  const hasFilters = () => Object.keys(state.colFilters).length > 0;
+  const isAdmin = () => !!(state.status && state.status.user && state.status.user.role === "admin");
 
   const columnByName = (name) => state.meta && state.meta.columns.find((c) => c.name === name);
   const visibleColumns = () => state.meta ? state.meta.columns.filter((c) => !state.hidden.has(c.name)) : [];
+  // canEdit: full control (admin) = add, delete and edit every column.
+  // canEditRows: may change values at all; regular users can update only the columns an admin allowed.
   const canEdit = () => state.meta && state.meta.editable && !(state.status && state.status.readOnly);
-
-  // ------------------------------------------------------------------ theme
-  function effectiveTheme() {
-    const t = document.documentElement.dataset.theme;
-    if (t) return t;
-    return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  }
-  function applyTheme(theme) {
-    if (theme) document.documentElement.dataset.theme = theme;
-    else delete document.documentElement.dataset.theme;
-    $("themeBtn").replaceChildren(icon(effectiveTheme() === "dark" ? "sun" : "moon"));
-  }
-
-  // ------------------------------------------------------------------ toasts / confirm
-  function toast(message, type = "ok") {
-    const el = h("div", { class: "toast" + (type === "error" ? " error" : ""), role: "status" }, message);
-    $("toasts").append(el);
-    setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 250); }, type === "error" ? 6000 : 3200);
-  }
-
-  function confirmDialog(title, text, okLabel = "Delete") {
-    return new Promise((resolve) => {
-      $("confirmTitle").textContent = title;
-      $("confirmText").textContent = text;
-      $("confirmOk").textContent = okLabel;
-      $("confirmScrim").hidden = false;
-      $("confirmOk").focus();
-      const done = (v) => {
-        $("confirmScrim").hidden = true;
-        $("confirmOk").onclick = $("confirmCancel").onclick = $("confirmScrim").onclick = null;
-        confirmDialog.active = null;
-        resolve(v);
-      };
-      confirmDialog.active = done;
-      $("confirmOk").onclick = () => done(true);
-      $("confirmCancel").onclick = () => done(false);
-      $("confirmScrim").onclick = (e) => { if (e.target === $("confirmScrim")) done(false); };
-    });
-  }
+  const userEditColumns = () => (state.meta && !isAdmin() && state.meta.editableColumns) || [];
+  const canEditRows = () => !!state.meta && (canEdit() || (userEditColumns().length > 0 && !(state.status && state.status.readOnly)));
+  const columnEditable = (name) => canEdit() || userEditColumns().includes(name);
 
   // ------------------------------------------------------------------ status / tables
   function showError(message) {
@@ -243,7 +119,10 @@
     $("sidebar").hidden = true;
     $("errorScreen").hidden = false;
     $("errorMessage").textContent = message;
+    $("errorHelp").hidden = !isAdmin();
+    $("retryBtn").replaceChildren(icon("refresh"), isAdmin() ? "Reload .env & retry" : "Try again");
   }
+  window.UI.onUnavailable = showError;
 
   function renderStatus(s) {
     $("dbPill").hidden = !s.file;
@@ -252,10 +131,17 @@
     $("dbEncrypted").hidden = !s.encrypted;
     $("dbReadonly").hidden = !s.readOnly;
     $("dbSize").textContent = s.sizeBytes != null ? fmtBytes(s.sizeBytes) : "";
+    $("reloadBtn").hidden = !isAdmin();
+    $("publishBtn").hidden = !isAdmin();
+    if (s.user && !state.menuRendered) {
+      window.UI.renderUserMenu($("userMenu"), s.user, "data");
+      state.menuRendered = true;
+    }
   }
 
   async function loadStatus(reload = false) {
-    const s = await api(reload ? "/api/reload" : "/api/status", reload ? { method: "POST", body: {} } : {});
+    const useReload = reload && isAdmin();
+    const s = await api(useReload ? "/api/reload" : "/api/status", useReload ? { method: "POST", body: {} } : {});
     state.status = s;
     renderStatus(s);
     if (!s.ok) { showError(s.error); return; }
@@ -268,12 +154,14 @@
   async function loadTables(keepCurrent = false) {
     const { tables } = await api("/api/tables");
     state.tables = tables;
+    await loadPublished();
     renderTableList();
     if (keepCurrent && state.table && tables.some((t) => t.name === state.table)) return;
     if (!tables.length) {
       state.table = null; state.meta = null;
-      $("tableTitle").textContent = "No tables";
-      $("tableSubtitle").textContent = "This database has no tables yet.";
+      $("tableTitle").textContent = isAdmin() ? "No tables" : "No data shared yet";
+      $("tableSubtitle").textContent = isAdmin() ? "This database has no tables yet."
+        : "An administrator hasn’t given you access to any data yet.";
       $("gridHead").replaceChildren(); $("gridBody").replaceChildren();
       $("addBtn").hidden = true;
       return;
@@ -316,8 +204,7 @@
     if (!keepSelection) state.selected.clear();
     const params = new URLSearchParams({ page: state.page, pageSize: state.pageSize, dir: state.dir });
     if (state.sort) params.set("sort", state.sort);
-    const filters = activeFilters();
-    if (filters.length) params.set("filters", JSON.stringify(filters));
+    if (hasFilters()) params.set("columnFilters", JSON.stringify(state.colFilters));
     const timer = setTimeout(() => { $("progress").hidden = false; $("tableScroll").classList.add("loading"); }, 120);
     try {
       const data = await api(`${tablePath(state.table)}/rows?${params}`, { signal: loadAbort.signal });
@@ -346,6 +233,84 @@
     renderColumnsList();
   }
 
+  /** Short text for a data-shown-to-users rule, e.g. "only state =TX, =CO". */
+  function summarizeRule(rule) {
+    if (!rule || rule.mode === "all") return "all rows" + sampleNote(rule);
+    if (rule.mode === "none") return "nothing (hidden)";
+    const f = Object.entries(rule.filters || {}).map(([c, v]) => `${c} ${v}`).join(" · ");
+    return "only " + f + sampleNote(rule);
+  }
+  const sampleNote = (rule) => (rule && rule.sample ? ` (a random ${fmt(rule.sample)} per user)` : "");
+
+  // ------------------------------------------------------------------ show data to users (admin)
+  async function loadPublished() {
+    if (!isAdmin()) return;
+    try { state.published = (await api("/api/admin/access-defaults")).rules; } catch { state.published = {}; }
+    try {
+      const vis = await api("/api/admin/visible-columns");
+      state.usersHidden = Object.fromEntries(vis.tables.map((t) =>
+        [t.name, t.columns.map((c) => c.name).filter((n) => !t.visible.includes(n))]));
+    } catch { state.usersHidden = {}; }
+    if (state.meta) renderSubtitle();
+  }
+
+  function openPublish() {
+    const table = state.table;
+    if (!table || !state.meta) return;
+    const filters = { ...state.colFilters };
+    const filtered = Object.keys(filters).length > 0;
+    const current = state.published[table];
+    const count = state.total;
+    const sampleInput = h("input", { type: "number", min: "1", step: "1", inputmode: "numeric", class: "sample-input",
+      placeholder: "All", "aria-label": "Number of random rows per user", value: current && current.sample ? String(current.sample) : "" });
+    const reshuffle = h("input", { type: "checkbox" });
+    const readSample = () => {
+      const raw = sampleInput.value.trim();
+      if (raw === "") return null;
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) throw new Error("Enter a whole number of rows, or leave it empty to show all.");
+      return n;
+    };
+    const save = async (mode) => {
+      try {
+        const sample = mode === "none" ? null : readSample();
+        const { rules } = await api("/api/admin/access-defaults");
+        rules[table] = { mode, filters: mode === "filtered" ? filters : {}, sample, reshuffle: reshuffle.checked };
+        const res = await api("/api/admin/access-defaults", { method: "PUT", body: { rules } });
+        state.published = res.rules;
+        renderSubtitle();
+        const per = sample ? `a random ${fmt(sample)}${mode === "filtered" ? " of " + fmt(count) : ""}` : null;
+        toast(mode === "none" ? `${table} is now hidden from users`
+          : mode === "all" ? `Users now see ${per ? per + " rows" : "all rows"} of ${table}`
+          : `Users now see ${per ? per + " matching rows" : fmt(count) + " row" + (count === 1 ? "" : "s")} of ${table}`);
+        close(true);
+      } catch (e) { toast(e.message, "error"); }
+    };
+    const filterText = Object.entries(filters).map(([c, v]) => `${c}: ${v}`).join("  ·  ");
+    const choice = (title, text, btn) => h("div", { class: "publish-choice" },
+      h("div", {}, h("b", {}, title), h("p", {}, text)), btn);
+    const { box, close } = window.UI.modal([
+      h("div", { class: "modal-icon info" }, icon("shield")),
+      h("h3", { id: "pubTitle" }, `Show “${table}” to users`),
+      h("p", { class: "publish-current" }, "Right now users see ", h("b", {}, summarizeRule(current)), "."),
+      h("label", { class: "publish-sample" },
+        h("span", {}, h("b", {}, "Random selection"), h("small", {}, "Optional. Each user gets their own random rows, kept the same between visits.")),
+        h("span", { class: "sample-field" }, sampleInput, h("span", {}, "rows"))),
+      current && current.sample
+        ? h("label", { class: "publish-reshuffle" }, reshuffle, "Pick new random rows for everyone") : null,
+      filtered
+        ? choice(`The ${fmt(count)} row${count === 1 ? "" : "s"} matching your filters`, filterText,
+          h("button", { class: "btn btn-primary", disabled: count === 0, onclick: () => save("filtered") }, "Show these rows"))
+        : choice("All rows", "No filters are active. To show only some rows, close this, set the column filters, then open this again.",
+          h("button", { class: "btn btn-primary", onclick: () => save("all") }, "Show all rows")),
+      filtered ? choice("All rows", "Remove the restriction.", h("button", { class: "btn", onclick: () => save("all") }, "Show all")) : null,
+      choice("Nothing", "Hide this table from users.", h("button", { class: "btn btn-danger-soft", onclick: () => save("none") }, "Hide table")),
+      h("p", { class: "publish-note" }, "Users can still filter, sort and search within the rows you show. Users with their own access rule (Users page) keep that rule. A random selection applies to the matching rows only."),
+      h("div", { class: "modal-actions" }, h("button", { class: "btn", onclick: () => close(false) }, "Close")),
+    ], { labelledBy: "pubTitle" });
+    box.classList.add("modal-wide");
+  }
+
   function renderSubtitle() {
     const m = state.meta;
     const t = state.tables.find((x) => x.name === state.table);
@@ -353,7 +318,12 @@
     if (t && t.rows != null) parts.push(`${fmt(t.rows)} rows`);
     parts.push(`${m.columns.length} columns`);
     if (m.kind === "view") parts.push("view");
-    if (!canEdit()) parts.push("read-only");
+    if (!canEdit()) parts.push(userEditColumns().length ? "you can edit: " + userEditColumns().join(", ") : "read-only");
+    if (m.restricted) parts.push("limited by your data access");
+    if (m.sample) parts.push(`a random selection of up to ${fmt(m.sample)} rows`);
+    if (isAdmin()) parts.push("users see: " + summarizeRule(state.published[state.table]));
+    const hiddenForUsers = isAdmin() ? (state.usersHidden[state.table] || []) : [];
+    if (hiddenForUsers.length) parts.push(`${hiddenForUsers.length} column${hiddenForUsers.length === 1 ? "" : "s"} hidden from users`);
     $("tableSubtitle").textContent = parts.join(" · ");
   }
 
@@ -376,16 +346,19 @@
         class: [sorted && "sorted", isNumericKind(col.kind) && col.name !== state.meta.key && "num"].filter(Boolean).join(" "),
         "aria-sort": sorted ? (state.dir === "asc" ? "ascending" : "descending") : "none",
       }, h("button", { class: "th-btn", title: `Sort by ${col.name}`, onclick: () => toggleSort(col.name) },
-        h("span", {}, col.name), col.type ? h("span", { class: "th-type" }, col.type) : null, icon(ic, "sort-ic")));
+        h("span", {}, col.name), col.type ? h("span", { class: "th-type" }, col.type) : null,
+        isAdmin() && (state.usersHidden[state.table] || []).includes(col.name)
+          ? h("span", { class: "th-hidden", title: "Hidden from users (Users → Visible columns)" }, icon("eye-off")) : null,
+        icon(ic, "sort-ic")));
       tr.append(th);
     }
-    if (edit) tr.append(h("th", { class: "act" }));
+    if (canEditRows()) tr.append(h("th", { class: "act" }));
 
     // Per-column filter boxes, aligned under each header.
     const fr = h("tr", { class: "filter-row" });
     if (edit) fr.append(h("th", { class: "sel" }));
     for (const col of visibleColumns()) fr.append(h("th", {}, filterControl(col)));
-    if (edit) fr.append(h("th", { class: "act" }));
+    if (canEditRows()) fr.append(h("th", { class: "act" }));
 
     // Keep focus/caret if the user is typing in a filter box while the head re-renders.
     const active = document.activeElement;
@@ -523,8 +496,9 @@
     async function load() {
       const params = new URLSearchParams({ column: col.name });
       if (search.value.trim()) params.set("search", search.value.trim());
-      const others = activeFilters(col.name);
-      if (others.length) params.set("filters", JSON.stringify(others));
+      const others = { ...state.colFilters };
+      delete others[col.name];
+      if (Object.keys(others).length) params.set("columnFilters", JSON.stringify(others));
       try {
         const data = await api(`${tablePath(state.table)}/values?${params}`);
         if (!picker || picker.el !== el) return;
@@ -692,10 +666,10 @@
         })));
       }
       for (const col of cols) tr.append(renderCell(col, row.values[col.name]));
-      if (edit) {
+      if (canEditRows()) {
         tr.append(h("td", { class: "act" }, h("div", { class: "row-actions" },
           h("button", { class: "icon-btn", title: "Edit", "aria-label": "Edit row", onclick: () => openEditor(row) }, icon("edit")),
-          h("button", { class: "icon-btn danger", title: "Delete", "aria-label": "Delete row", onclick: () => deleteRows([row.key]) }, icon("trash")))));
+          edit ? h("button", { class: "icon-btn danger", title: "Delete", "aria-label": "Delete row", onclick: () => deleteRows([row.key]) }, icon("trash")) : null)));
       }
       return tr;
     }));
@@ -791,7 +765,7 @@
 
   function openEditor(row) {
     const meta = state.meta;
-    const edit = canEdit();
+    const edit = canEditRows();
     const isNew = !row;
     editor = { row, isNew, fields: new Map() };
     const keyCol = meta.key;
@@ -799,12 +773,16 @@
     $("drawerTitle").textContent = isNew ? "New row"
       : !edit ? "Row details"
       : keyCol ? `Edit row · ${keyCol} ${row.key}` : `Edit row #${row.key}`;
-    $("drawerDelete").hidden = isNew || !edit;
+    $("drawerDelete").hidden = isNew || !canEdit();
     $("drawerSave").hidden = !edit;
     $("drawerSave").textContent = isNew ? "Create row" : "Save changes";
     $("drawerCancel").textContent = edit ? "Cancel" : "Close";
 
     const fields = meta.columns.map((col) => buildField(col, isNew ? undefined : row.values[col.name], isNew, edit));
+    if (edit && !canEdit()) {  // regular user: say which fields they may change
+      fields.unshift(h("div", { class: "notice" }, icon("edit"),
+        h("div", {}, "You can edit ", h("b", {}, userEditColumns().join(", ")), ". The other fields are read-only.")));
+    }
     $("drawerFields").replaceChildren(...fields);
     updateDirty();
 
@@ -817,7 +795,7 @@
 
   function buildField(col, raw, isNew, edit) {
     const isBlob = raw && typeof raw === "object" && "$blob" in raw;
-    const locked = !edit || col.readonly || col.kind === "blob" || isBlob;
+    const locked = !edit || !columnEditable(col.name) || col.readonly || col.kind === "blob" || isBlob;
     // A new row starts NULL unless the column is NOT NULL without a default.
     let original;
     if (isNew) original = col.notnull && col.default == null && !col.readonly ? (col.kind === "boolean" ? 0 : "") : null;
@@ -920,7 +898,7 @@
 
   async function saveEditor(e) {
     e.preventDefault();
-    if (!editor || !canEdit()) return;
+    if (!editor || !canEditRows()) return;
     const values = changedValues();
     const btn = $("drawerSave");
     btn.disabled = true;
@@ -971,15 +949,10 @@
 
   // ------------------------------------------------------------------ wiring
   function bind() {
-    applyTheme(store.get("theme", null));
-    $("themeBtn").onclick = () => {
-      const next = effectiveTheme() === "dark" ? "light" : "dark";
-      store.set("theme", next); applyTheme(next);
-    };
-    matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => applyTheme(store.get("theme", null)));
+    window.UI.bindTheme($("themeBtn"));
 
     const reload = async () => {
-      try { await loadStatus(true); toast("Reloaded .env and reconnected"); }
+      try { await loadStatus(true); if (isAdmin()) toast("Reloaded .env and reconnected"); }
       catch (e) { if (e.code !== "database_unavailable") toast(e.message, "error"); }
     };
     $("reloadBtn").onclick = reload;
@@ -1010,6 +983,7 @@
     $("clearAllEmpty").onclick = clearAll;
 
     $("addBtn").onclick = () => openEditor(null);
+    $("publishBtn").onclick = openPublish;
     $("bulkDeleteBtn").onclick = () => deleteRows([...state.selected]);
     $("rowForm").onsubmit = saveEditor;
     $("drawerClose").onclick = closeEditor;
@@ -1019,8 +993,8 @@
 
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
-        if (confirmDialog.active) confirmDialog.active(false);
-        else if (editor) closeEditor();
+        if (window.UI.closeDialog()) return;
+        if (editor) closeEditor();
         else closePopovers();
         return;
       }
@@ -1030,7 +1004,7 @@
         const first = $("gridHead").querySelector(".col-filter");
         if (first) first.focus();
       }
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && editor && canEdit()) $("rowForm").requestSubmit();
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && editor && canEditRows()) $("rowForm").requestSubmit();
     });
   }
 

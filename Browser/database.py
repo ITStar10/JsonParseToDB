@@ -4,6 +4,7 @@ The browser edits the configured file in place. Table and column names come
 from the database schema and are allow-listed before they are placed in SQL;
 every value is passed as a bound parameter.
 """
+import hashlib
 import importlib
 import re
 import sqlite3
@@ -35,6 +36,16 @@ FILTER_OPS = {
     "is_null":      (False, "{c} IS NULL", None),
     "not_null":     (False, "{c} IS NOT NULL", None),
 }
+
+
+def sample_rank(key, seed):
+    """Stable pseudo-random rank of a row for a given seed (registered in SQLite as dbb_rank).
+
+    The same (key, seed) always gives the same rank, so a user's random sample stays the same
+    between requests and across pages; a different seed gives an unrelated ordering.
+    """
+    digest = hashlib.blake2b(f"{seed}\x00{key}".encode("utf-8", "replace"), digest_size=8).digest()
+    return int.from_bytes(digest, "big") >> 1  # fits SQLite's signed 64-bit integer
 
 
 class DatabaseUnavailable(Exception):
@@ -204,6 +215,7 @@ class Database:
                 raise DatabaseUnavailable(
                     f"{path.name} is not a readable SQLite database.") from None
             conn.execute("PRAGMA busy_timeout = 30000")
+            conn.create_function("dbb_rank", 2, sample_rank, deterministic=True)
             if self.settings.read_only:
                 conn.execute("PRAGMA query_only = ON")
         except BaseException:
@@ -243,7 +255,12 @@ class Database:
             return info
 
     # ------------------------------------------------------------------ schema
-    def tables(self):
+    def tables(self, scope=None):
+        """List tables/views with row counts.
+
+        `scope(table)` may return None to hide a table, or {"filters": [...], "sample": {...}|None}
+        restricting which rows are counted (per-user data access).
+        """
         with self._lock:
             conn = self.connection()
             rows = conn.execute(
@@ -251,11 +268,17 @@ class Database:
                 "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name").fetchall()
             result = []
             for name, kind in rows:
+                table = self.table(name)
+                scoped = scope(table) if scope else {"filters": [], "sample": None}
+                if scoped is None:
+                    continue
+                where, params = self._where(table, "", None, scoped["filters"],
+                                            sample=self.sample_spec(scoped))
                 try:
-                    count = conn.execute(f"SELECT count(*) FROM {quote(name)}").fetchone()[0]
+                    count = conn.execute(f"SELECT count(*) FROM {quote(name)}{where}",
+                                         params).fetchone()[0]
                 except self._driver.DatabaseError:
                     count = None
-                table = self.table(name)
                 result.append({"name": name, "kind": kind, "rows": count,
                                "readonly": table.readonly})
             return result
@@ -335,11 +358,30 @@ class Database:
         cols = ", ".join(quote(c.name) for c in table.columns)
         return f"{table.key_expr}, {cols}" if table.key_expr else cols
 
-    def _where(self, table, search, search_column, filters):
+    @staticmethod
+    def sample_spec(scoped):
+        """Turn a scope ({"filters", "sample"}) into the `sample=` argument of the query methods."""
+        sample = scoped.get("sample")
+        return {**sample, "filters": scoped["filters"]} if sample else None
+
+    def _where(self, table, search, search_column, filters, sample=None, search_columns=None):
+        """WHERE clause. `sample` = {"size", "seed", "filters"} keeps only `size` pseudo-randomly
+        chosen rows among those matching `filters` (the access rule), before other filters apply."""
         clauses, params = [], []
+        if sample:
+            if not table.key_expr:
+                raise RequestError(f"{table.name} has no row key, so it can't be sampled")
+            key = table.key_expr
+            sub_where, sub_params = self._where(table, "", None, sample.get("filters"))
+            clauses.append(f"{key} IN (SELECT {key} FROM {quote(table.name)}{sub_where} "
+                           "ORDER BY dbb_rank(" + key + ", ?) LIMIT ?)")
+            params.extend([*sub_params, str(sample["seed"]), int(sample["size"])])
         if search:
             cols = [table.column(search_column)] if search_column else [
-                c for c in table.columns if c.kind != "blob"]
+                c for c in table.columns if c.kind != "blob"
+                and (search_columns is None or c.name in search_columns)]
+            if not cols:
+                return " WHERE 0", []
             for term in search.split():
                 like = f"%{escape_like(term)}%"
                 ors = [f"CAST({quote(c.name)} AS TEXT) LIKE ? ESCAPE '\\'" for c in cols]
@@ -387,7 +429,7 @@ class Database:
             params.append(value)
         return template.format(c=quote(col.name))
 
-    def distinct_values(self, name, column, *, search="", filters=None):
+    def distinct_values(self, name, column, *, search="", filters=None, sample=None):
         """Distinct values of one column (NULL and '' merged) with row counts."""
         with self._lock:
             table = self.table(name)
@@ -395,7 +437,7 @@ class Database:
             if col.kind == "blob":
                 raise RequestError("Binary columns have no value list")
             c = quote(col.name)
-            where, params = self._where(table, "", None, filters)
+            where, params = self._where(table, "", None, filters, sample=sample)
             if search:
                 where += (" AND " if where else " WHERE ") + \
                     f"CAST({c} AS TEXT) LIKE ? ESCAPE '\\'"
@@ -412,13 +454,14 @@ class Database:
                                for v, n in rows[:DISTINCT_LIMIT]]}
 
     def rows(self, name, *, search="", search_column=None, filters=None,
-             sort=None, direction="asc", page=1, page_size=50):
+             sort=None, direction="asc", page=1, page_size=50, sample=None, search_columns=None):
         page = max(1, int(page))
         page_size = min(MAX_PAGE_SIZE, max(1, int(page_size)))
         direction = "DESC" if str(direction).lower() == "desc" else "ASC"
         with self._lock:
             table = self.table(name)
-            where, params = self._where(table, search.strip(), search_column, filters)
+            where, params = self._where(table, search.strip(), search_column, filters, sample=sample,
+                                        search_columns=search_columns)
             order = []
             if sort:
                 order.append(f"{quote(table.column(sort).name)} COLLATE NOCASE {direction}")
@@ -517,6 +560,18 @@ class Database:
             else:
                 key = dict((c.name, v) for c, v in pairs).get(table.key_column)
             return self._fetch_one(table, key)
+
+    def row_visible(self, name, key, filters=None, sample=None):
+        """True if the row exists and matches `filters` / `sample` (a user's data access)."""
+        with self._lock:
+            table = self.table(name)
+            if not table.key_expr:
+                return False
+            where, params = self._where(table, "", None, filters, sample=sample)
+            where += (" AND " if where else " WHERE ") + f"{table.key_expr} = ?"
+            row = self.connection().execute(
+                f"SELECT 1 FROM {quote(name)}{where} LIMIT 1", [*params, self._key(table, key)]).fetchone()
+            return row is not None
 
     def update(self, name, key, values):
         with self._lock:

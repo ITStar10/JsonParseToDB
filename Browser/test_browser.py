@@ -1,4 +1,5 @@
 """Tests for the DB Browser API. Run from Browser/: python -m unittest -v"""
+import atexit
 import importlib
 import json
 import sqlite3
@@ -40,9 +41,37 @@ def make_db(folder, name, password=""):
     return out
 
 
-def settings(path, password="", read_only=False):
+_TMP_DIRS = []
+
+
+def temp_dir():
+    d = tempfile.TemporaryDirectory()
+    _TMP_DIRS.append(d)
+    return Path(d.name)
+
+
+atexit.register(lambda: [d.cleanup() for d in _TMP_DIRS])
+
+ADMIN = {"fullName": "Ada Admin", "email": "admin@example.com", "password": "admin-pass-123"}
+
+
+def settings(path, password="", read_only=False, users_db=None):
+    """Test settings; every app gets its own throwaway users database."""
     return Settings(db_path=path, db_password=password, host="127.0.0.1",
-                    port=5000, read_only=read_only, debug=False)
+                    port=5000, read_only=read_only, debug=False,
+                    users_db_path=users_db or temp_dir() / "users.sqlite3",
+                    secret_key="test-secret-key-" + "x" * 32)
+
+
+def login_admin(app):
+    """Create the admin account (once) and return a signed-in test client."""
+    users = app.extensions["users"]
+    if users.count_admins() == 0:
+        users.create(ADMIN["fullName"], ADMIN["email"], ADMIN["password"], role="admin", status="approved")
+    client = app.test_client()
+    res = client.post("/api/auth/login", json={"email": ADMIN["email"], "password": ADMIN["password"]})
+    assert res.status_code == 200, res.json
+    return client
 
 
 class BrowserApiMixin:
@@ -53,7 +82,7 @@ class BrowserApiMixin:
         self.path = make_db(self.tmp.name, "test.sqlite3", self.password)
         self.app = create_app(settings(self.path, self.password))
         self.app.testing = True
-        self.client = self.app.test_client()
+        self.client = login_admin(self.app)
 
     def tearDown(self):
         self.app.extensions["db"].close()
@@ -236,7 +265,7 @@ class ConfigurationErrorTests(unittest.TestCase):
     def status(self, path, password=""):
         app = create_app(settings(path, password))
         try:
-            return app.test_client().get("/api/status").json
+            return login_admin(app).get("/api/status").json
         finally:
             app.extensions["db"].close()
 
@@ -261,14 +290,14 @@ class ConfigurationErrorTests(unittest.TestCase):
 
     def test_unavailable_database_returns_503(self):
         app = create_app(settings(Path(self.tmp.name, "missing.sqlite3")))
-        res = app.test_client().get("/api/tables")
+        res = login_admin(app).get("/api/tables")
         self.assertEqual(res.status_code, 503)
         self.assertEqual(res.json["code"], "database_unavailable")
 
     def test_read_only_mode(self):
         path = make_db(self.tmp.name, "ro.sqlite3")
         app = create_app(settings(path, read_only=True))
-        client = app.test_client()
+        client = login_admin(app)
         self.assertEqual(client.get("/api/tables/records/rows").status_code, 200)
         self.assertEqual(client.patch("/api/tables/records/rows/1",
                                       json={"values": {"city": "x"}}).status_code, 400)
@@ -278,7 +307,7 @@ class ConfigurationErrorTests(unittest.TestCase):
     def test_host_header_check(self):
         path = make_db(self.tmp.name, "host.sqlite3")
         app = create_app(settings(path))
-        client = app.test_client()
+        client = login_admin(app)
         self.assertEqual(client.get("/api/status", headers={"Host": "evil.example"}).status_code, 403)
         self.assertEqual(client.get("/api/status", headers={"Host": "localhost:5000"}).status_code, 200)
         app.extensions["db"].close()
@@ -307,7 +336,7 @@ class GenericTableTests(unittest.TestCase):
             """)
         conn.close()
         self.app = create_app(settings(self.path))
-        self.client = self.app.test_client()
+        self.client = login_admin(self.app)
 
     def tearDown(self):
         self.app.extensions["db"].close()
