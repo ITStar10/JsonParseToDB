@@ -13,7 +13,7 @@ CHUNK_SIZE = 65536
 SCHEMA_VERSION = 2
 COLUMNS = (
     "firstName", "lastName", "phone", "address", "city", "state", "zip",
-    "email", "dateOfBirth", "ssn", "useOrders", "isSold", "id",
+    "email", "dateOfBirth", "ssn", "userOrders", "isSold", "id",
 )
 
 
